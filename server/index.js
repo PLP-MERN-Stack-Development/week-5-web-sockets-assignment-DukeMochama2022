@@ -6,10 +6,17 @@ const { Server } = require("socket.io");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const path = require("path");
+const connectDB = require("./utils/db");
+const Message = require("./models/Message");
+const User = require("./models/User");
+const messageRoutes = require("./routes/messageRoutes");
+const userRoutes = require("./routes/userRoutes");
+const roomRoutes = require("./routes/roomRoutes");
 
 // Load environment variables
 dotenv.config();
 
+connectDB();
 // Initialize Express app
 const app = express();
 const server = http.createServer(app);
@@ -42,11 +49,23 @@ io.on("connection", (socket) => {
   socket.emit("room_list", rooms);
 
   // Handle user joining
-  socket.on("user_join", (username) => {
+  socket.on("user_join", async (username) => {
     users[socket.id] = { username, id: socket.id };
     socket.join("general");
+    socket.join(socket.id);
     socket.currentRoom = "general";
-    io.emit("user_list", Object.values(users));
+    // Upsert user in MongoDB
+    await User.findOneAndUpdate(
+      { username },
+      { username, socketId: socket.id },
+      { upsert: true, new: true }
+    );
+    // Emit updated user list from DB
+    const dbUsers = await User.find({});
+    io.emit(
+      "user_list",
+      dbUsers.map((u) => ({ username: u.username, id: u.socketId }))
+    );
     io.emit("user_joined", { username, id: socket.id });
     io.emit("room_list", rooms);
     console.log(`${username} joined the chat`);
@@ -70,25 +89,31 @@ io.on("connection", (socket) => {
     });
   });
 
-  // Handle chat messages (to room)
-  socket.on("send_message", (messageData, callback) => {
-    const { message, room, image, tempId } = messageData;
-    const currentRoom = room || socket.currentRoom || "general";
-    const msgObj = {
-      message,
-      image,
-      id: Date.now(),
-      tempId,
-      sender: users[socket.id]?.username || "Anonymous",
-      senderId: socket.id,
-      room: currentRoom,
-      timestamp: new Date().toISOString(),
-    };
-    messages.push(msgObj);
-    if (messages.length > 100) messages.shift();
-    io.to(currentRoom).emit("receive_message", msgObj);
-    if (callback) callback({ delivered: true, id: msgObj.id, tempId });
-  });
+  // Handle public messages
+  socket.on(
+    "send_message",
+    async ({ message, room, image, tempId }, callback) => {
+      try {
+        const messageData = new Message({
+          room,
+          sender: users[socket.id]?.username || "Anonymous",
+          senderId: socket.id,
+          message,
+          image,
+          tempId,
+          timestamp: new Date(),
+          isPrivate: false,
+        });
+        await messageData.save();
+        io.to(room).emit("receive_message", messageData.toObject());
+        if (callback)
+          callback({ delivered: true, id: messageData._id, tempId });
+      } catch (err) {
+        if (callback)
+          callback({ delivered: false, error: err.message, tempId });
+      }
+    }
+  );
 
   // Handle typing indicator
   socket.on("typing", (isTyping) => {
@@ -106,24 +131,92 @@ io.on("connection", (socket) => {
   });
 
   // Handle private messages
-  socket.on("private_message", ({ to, message, image, tempId }, callback) => {
-    const messageData = {
-      id: Date.now(),
-      tempId,
-      sender: users[socket.id]?.username || "Anonymous",
-      senderId: socket.id,
-      to,
-      message,
-      image,
-      timestamp: new Date().toISOString(),
-      isPrivate: true,
-      read: false,
-    };
-
-    socket.to(to).emit("private_message", messageData);
-    socket.emit("private_message", messageData);
-    if (callback) callback({ delivered: true, id: messageData.id, tempId });
-  });
+  socket.on(
+    "private_message",
+    async ({ to, toUsername, message, image, tempId }, callback) => {
+      try {
+        console.log(
+          "[PRIVATE MESSAGE] to:",
+          to,
+          "toUsername:",
+          toUsername,
+          "message:",
+          message
+        );
+        console.log("[USERS]", users);
+        // Find recipient username by socket ID
+        const recipientUser = users[to];
+        const resolvedToUsername = recipientUser
+          ? recipientUser.username
+          : toUsername;
+        const messageData = new Message({
+          room: null,
+          sender: users[socket.id]?.username || "Anonymous",
+          senderId: socket.id,
+          to,
+          toUsername: resolvedToUsername,
+          message,
+          image,
+          tempId,
+          timestamp: new Date(),
+          isPrivate: true,
+          read: false,
+        });
+        await messageData.save();
+        let delivered = false;
+        // Try to deliver by socket ID
+        let recipientSocket = io.sockets.sockets.get(to);
+        if (recipientSocket) {
+          recipientSocket.emit("private_message", messageData.toObject());
+          console.log("[PRIVATE MESSAGE] Delivered to socketId:", to);
+          delivered = true;
+        } else {
+          // Try to find by username
+          const userEntry = Object.values(users).find(
+            (u) => u.username === resolvedToUsername
+          );
+          if (userEntry) {
+            recipientSocket = io.sockets.sockets.get(userEntry.id);
+            if (recipientSocket) {
+              recipientSocket.emit("private_message", messageData.toObject());
+              console.log(
+                "[PRIVATE MESSAGE] Fallback delivered to username:",
+                resolvedToUsername,
+                "socketId:",
+                userEntry.id
+              );
+              delivered = true;
+            } else {
+              console.warn(
+                "[PRIVATE MESSAGE] No socket found for username fallback:",
+                resolvedToUsername
+              );
+            }
+          } else {
+            console.warn(
+              "[PRIVATE MESSAGE] Recipient not found for username:",
+              resolvedToUsername
+            );
+          }
+        }
+        socket.emit("private_message", messageData.toObject());
+        if (callback) {
+          if (delivered) {
+            callback({ delivered: true, id: messageData._id, tempId });
+          } else {
+            callback({
+              delivered: false,
+              error: "Recipient not connected",
+              tempId,
+            });
+          }
+        }
+      } catch (err) {
+        if (callback)
+          callback({ delivered: false, error: err.message, tempId });
+      }
+    }
+  );
 
   // Handle private message read receipts
   socket.on("private_message_read", ({ messageId, recipientId }) => {
@@ -198,30 +291,10 @@ io.on("connection", (socket) => {
   });
 });
 
-// API routes
-app.get("/api/messages", (req, res) => {
-  const { room = "general", offset = 0, limit = 20 } = req.query;
-  // Filter messages for the room
-  const roomMessages = messages.filter((msg) => msg.room === room);
-  // Paginate: get the last N messages, then older
-  const start = Math.max(roomMessages.length - offset - limit, 0);
-  const end = roomMessages.length - offset;
-  const paginated = roomMessages.slice(start, end);
-  res.json({
-    messages: paginated,
-    hasMore: start > 0,
-    total: roomMessages.length,
-  });
-});
-
-app.get("/api/users", (req, res) => {
-  res.json(Object.values(users));
-});
-
-// Add API endpoint for rooms
-app.get("/api/rooms", (req, res) => {
-  res.json(rooms);
-});
+// Use API routes
+app.use("/api/messages", messageRoutes);
+app.use("/api/users", userRoutes);
+app.use("/api/rooms", roomRoutes);
 
 // Root route
 app.get("/", (req, res) => {

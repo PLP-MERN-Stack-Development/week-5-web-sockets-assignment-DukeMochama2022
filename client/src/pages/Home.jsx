@@ -141,6 +141,7 @@ export default function Home() {
       }
     });
     socket.on("private_message", (msg) => {
+      console.log("Received private message:", msg);
       const mySocketId = socket.id;
       const otherUserId = msg.senderId === mySocketId ? msg.to : msg.senderId;
       const user = onlineUsersRef.current.find((u) => u.id === otherUserId);
@@ -309,6 +310,21 @@ export default function Home() {
     }
   }, [username, socket]);
 
+  // Emit user_join on every socket connect/reconnect
+  useEffect(() => {
+    const handleConnect = () => {
+      setIsConnected(true);
+      toast.success("Reconnected to server!");
+      if (username) {
+        socket.emit("user_join", username);
+      }
+    };
+    socket.on("connect", handleConnect);
+    return () => {
+      socket.off("connect", handleConnect);
+    };
+  }, [socket, username]);
+
   // Reset unread count when entering a room
   useEffect(() => {
     setUnreadRooms((prev) => ({ ...prev, [currentRoom]: 0 }));
@@ -330,18 +346,12 @@ export default function Home() {
 
   // Reconnection logic and user feedback
   useEffect(() => {
-    const handleConnect = () => {
-      setIsConnected(true);
-      toast.success("Reconnected to server!");
-    };
     const handleDisconnect = () => {
       setIsConnected(false);
       toast.error("Disconnected from server. Trying to reconnect...");
     };
-    socket.on("connect", handleConnect);
     socket.on("disconnect", handleDisconnect);
     return () => {
-      socket.off("connect", handleConnect);
       socket.off("disconnect", handleDisconnect);
     };
   }, [socket]);
@@ -457,7 +467,13 @@ export default function Home() {
 
   // Handle opening a private chat
   const handleSelectUser = (user) => {
-    setPrivateChatUser(user);
+    // Find the latest user object from onlineUsers
+    const latestUser = onlineUsers.find((u) => u.username === user.username);
+    if (latestUser) {
+      setPrivateChatUser(latestUser);
+    } else {
+      setPrivateChatUser(user);
+    }
     setPrivateMessages([]);
     setPrivateInput("");
   };
@@ -466,6 +482,12 @@ export default function Home() {
   const handleSendPrivate = (e, image) => {
     e.preventDefault();
     if ((privateInput.trim() || image) && privateChatUser) {
+      console.log(
+        "Sending private message to:",
+        privateChatUser.username,
+        "socketId:",
+        privateChatUser.id
+      );
       const tempId = uuidv4();
       const newMsg = {
         id: tempId,
@@ -475,14 +497,21 @@ export default function Home() {
         sender: username,
         senderId: socket.id,
         to: privateChatUser.id,
+        toUsername: privateChatUser.username,
         timestamp: new Date().toISOString(),
-        isMe: true, // <-- change to senderId === socket.id for consistency
+        isMe: true,
         status: "sending",
       };
       setPrivateMessages((prev) => [...prev, newMsg]);
       socket.emit(
         "private_message",
-        { to: privateChatUser.id, message: privateInput, image, tempId },
+        {
+          to: privateChatUser.id,
+          toUsername: privateChatUser.username,
+          message: privateInput,
+          image,
+          tempId,
+        },
         (ack) => {
           if (ack && ack.delivered && ack.tempId) {
             setPrivateMessages((prev) =>
@@ -492,10 +521,16 @@ export default function Home() {
                   : m
               )
             );
+          } else if (ack && ack.delivered === false) {
+            setPrivateMessages((prev) =>
+              prev.map((m) =>
+                m.tempId === ack.tempId ? { ...m, status: "failed" } : m
+              )
+            );
+            toast.error("Failed to deliver private message.");
           }
         }
       );
-      // Fallback: mark as failed if not delivered in 5s
       setTimeout(() => {
         setPrivateMessages((prev) =>
           prev.map((m) =>
